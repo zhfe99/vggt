@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -41,6 +42,55 @@ def _depth_to_uint16(depth: np.ndarray) -> np.ndarray:
     depth_norm = (depth - vmin) / (vmax - vmin)
     depth_norm = np.clip(depth_norm, 0.0, 1.0)
     return (depth_norm * 65535.0).round().astype(np.uint16)
+
+
+def _depth_u16_to_u8(depth_u16: np.ndarray) -> np.ndarray:
+    return (depth_u16.astype(np.float32) / 257.0).round().clip(0, 255).astype(np.uint8)
+
+
+def _project_depth_to_original(
+    *,
+    depth_u8: np.ndarray,
+    orig_w: int,
+    orig_h: int,
+    preprocess_mode: str,
+    target_size: int = 518,
+) -> np.ndarray | None:
+    if depth_u8.ndim != 2:
+        return None
+
+    if preprocess_mode not in {"pad", "crop"}:
+        return None
+
+    if preprocess_mode == "pad":
+        if orig_w >= orig_h:
+            new_w = target_size
+            new_h = int(round(orig_h * (new_w / orig_w) / 14.0) * 14)
+        else:
+            new_h = target_size
+            new_w = int(round(orig_w * (new_h / orig_h) / 14.0) * 14)
+
+        pad_top = (target_size - new_h) // 2
+        pad_left = (target_size - new_w) // 2
+        crop = depth_u8[pad_top : pad_top + new_h, pad_left : pad_left + new_w]
+        crop_img = Image.fromarray(crop, mode="L")
+        out = crop_img.resize((orig_w, orig_h), resample=Image.Resampling.NEAREST)
+        return np.asarray(out)
+
+    new_w = target_size
+    new_h = int(round(orig_h * (new_w / orig_w) / 14.0) * 14)
+    if new_h <= 0:
+        return None
+    if new_h > target_size:
+        start_y = (new_h - target_size) // 2
+        full = np.zeros((new_h, new_w), dtype=np.uint8)
+        full[start_y : start_y + target_size, :] = depth_u8
+        full_img = Image.fromarray(full, mode="L")
+    else:
+        full_img = Image.fromarray(depth_u8, mode="L")
+
+    out = full_img.resize((orig_w, orig_h), resample=Image.Resampling.NEAREST)
+    return np.asarray(out)
 
 
 def _safe_load_images(
@@ -187,7 +237,70 @@ def main() -> None:
                     ) from e
 
                 png_path = img_out_dir / f"{stem}.depth.png"
-                iio.imwrite(png_path, _depth_to_uint16(depth_i))
+                depth_u16 = _depth_to_uint16(depth_i)
+                iio.imwrite(png_path, depth_u16)
+
+                try:
+                    img_in = images[i].detach().float().cpu().numpy()  # [3, H, W] in [0,1]
+                    img_in = np.transpose(img_in, (1, 2, 0))
+                    img_u8 = (np.clip(img_in, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+                    depth_u8 = _depth_u16_to_u8(depth_u16)
+                    depth_rgb = np.repeat(depth_u8[..., None], 3, axis=2)
+
+                    if img_u8.shape[:2] == depth_rgb.shape[:2]:
+                        debug = np.concatenate([img_u8, depth_rgb], axis=1)
+                        debug_path = img_out_dir / f"{stem}.debug.png"
+                        iio.imwrite(debug_path, debug)
+
+                        alpha = 0.65
+                        overlay = (
+                            (1.0 - alpha) * img_u8.astype(np.float32) + alpha * depth_rgb.astype(np.float32)
+                        ).round().clip(0, 255).astype(np.uint8)
+
+                        gx = np.abs(np.diff(depth_u8.astype(np.int16), axis=1, prepend=depth_u8[:, :1]))
+                        gy = np.abs(np.diff(depth_u8.astype(np.int16), axis=0, prepend=depth_u8[:1, :]))
+                        edges = (gx + gy) > 20
+                        overlay[edges] = np.array([255, 0, 0], dtype=np.uint8)
+                        overlay_path = img_out_dir / f"{stem}.overlay.png"
+                        iio.imwrite(overlay_path, overlay)
+
+                    try:
+                        orig_img = Image.open(img_path)
+                        if orig_img.mode == "RGBA":
+                            background = Image.new("RGBA", orig_img.size, (255, 255, 255, 255))
+                            orig_img = Image.alpha_composite(background, orig_img)
+                        orig_img = orig_img.convert("RGB")
+                        orig_w, orig_h = orig_img.size
+                        depth_on_orig = _project_depth_to_original(
+                            depth_u8=depth_u8,
+                            orig_w=orig_w,
+                            orig_h=orig_h,
+                            preprocess_mode=args.preprocess_mode,
+                        )
+                        if depth_on_orig is not None:
+                            orig_u8 = np.asarray(orig_img, dtype=np.uint8)
+                            depth_on_orig_rgb = np.repeat(depth_on_orig[..., None], 3, axis=2)
+                            alpha = 0.65
+                            orig_overlay = (
+                                (1.0 - alpha) * orig_u8.astype(np.float32)
+                                + alpha * depth_on_orig_rgb.astype(np.float32)
+                            ).round().clip(0, 255).astype(np.uint8)
+
+                            gx = np.abs(
+                                np.diff(depth_on_orig.astype(np.int16), axis=1, prepend=depth_on_orig[:, :1])
+                            )
+                            gy = np.abs(
+                                np.diff(depth_on_orig.astype(np.int16), axis=0, prepend=depth_on_orig[:1, :])
+                            )
+                            edges = (gx + gy) > 20
+                            orig_overlay[edges] = np.array([255, 0, 0], dtype=np.uint8)
+                            orig_overlay_path = img_out_dir / f"{stem}.orig_overlay.png"
+                            iio.imwrite(orig_overlay_path, orig_overlay)
+                    except Exception as e:
+                        print(f"Warning: failed to write original-space overlay for {img_path}. Error: {e}")
+                except Exception as e:
+                    print(f"Warning: failed to write debug composite for {img_path}. Error: {e}")
 
         torch.cuda.empty_cache()
 
