@@ -15,6 +15,18 @@ def _read_image_list(txt_path: str) -> list[str]:
     return image_paths
 
 
+def _read_image_dir(image_dir: str, *, recursive: bool) -> list[str]:
+    p = Path(image_dir)
+    if not p.exists() or not p.is_dir():
+        raise ValueError(f"--image_dir must be an existing directory, got: {image_dir}")
+
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+    it = p.rglob("*") if recursive else p.iterdir()
+    files = [f for f in it if f.is_file() and f.suffix.lower() in exts]
+    files.sort()
+    return [str(f) for f in files]
+
+
 def _depth_to_uint16(depth: np.ndarray) -> np.ndarray:
     depth = depth.astype(np.float32)
     finite = np.isfinite(depth)
@@ -31,10 +43,47 @@ def _depth_to_uint16(depth: np.ndarray) -> np.ndarray:
     return (depth_norm * 65535.0).round().astype(np.uint16)
 
 
+def _safe_load_images(
+    image_paths: list[str],
+    *,
+    mode: str,
+    device: str,
+) -> tuple[torch.Tensor | None, list[str]]:
+    try:
+        images = load_and_preprocess_images(image_paths, mode=mode).to(device)
+        return images, image_paths
+    except Exception as e:
+        print(f"Warning: failed to load a batch of {len(image_paths)} images, will try per-image. Error: {e}")
+
+    ok_images: list[torch.Tensor] = []
+    ok_paths: list[str] = []
+    for p in image_paths:
+        try:
+            img = load_and_preprocess_images([p], mode=mode).to(device)
+        except Exception as e:
+            print(f"Warning: skipping unreadable image: {p}. Error: {e}")
+            continue
+        ok_images.append(img)
+        ok_paths.append(p)
+
+    if len(ok_images) == 0:
+        return None, []
+
+    images = torch.cat(ok_images, dim=0)
+    return images, ok_paths
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export per-image depth using VGGT")
-    parser.add_argument("--image_list", type=str, required=True, help="Path to txt file, one image path per line")
-    parser.add_argument("--out_dir", type=str, required=True, help="Output directory")
+    parser.add_argument("--image_list", type=str, default=None, help="Path to txt file, one image path per line")
+    parser.add_argument("--image_dir", type=str, default=None, help="Path to a directory of images")
+    parser.add_argument(
+        "--no_recursive",
+        action="store_true",
+        default=False,
+        help="Disable recursive scan when using --image_dir (recursive is enabled by default)",
+    )
+    parser.add_argument("--out_dir", type=str, default=None, help="Output directory")
     parser.add_argument(
         "--preprocess_mode",
         type=str,
@@ -66,16 +115,30 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if (args.image_list is None) == (args.image_dir is None):
+        raise ValueError("Specify exactly one of --image_list or --image_dir")
+
     device = args.device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    out_dir = Path(args.out_dir)
+    if args.out_dir is None:
+        if args.image_dir is None:
+            raise ValueError("--out_dir is required when using --image_list")
+        out_dir = Path(f"{args.image_dir}_vggt")
+    else:
+        out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    image_paths = _read_image_list(args.image_list)
+    image_root: Path | None = None
+    if args.image_list is not None:
+        image_paths = _read_image_list(args.image_list)
+    else:
+        image_root = Path(args.image_dir)
+        image_paths = _read_image_dir(args.image_dir, recursive=(not args.no_recursive))
     if len(image_paths) == 0:
-        raise ValueError(f"No valid image paths found in {args.image_list}")
+        src = args.image_list if args.image_list is not None else args.image_dir
+        raise ValueError(f"No valid image paths found in {src}")
 
     model = VGGT.from_pretrained("facebook/VGGT-1B")
     model.eval()
@@ -86,20 +149,33 @@ def main() -> None:
     for start in range(0, len(image_paths), args.batch_size):
         batch_paths = image_paths[start : start + args.batch_size]
 
-        images = load_and_preprocess_images(batch_paths, mode=args.preprocess_mode).to(device)
+        images, ok_paths = _safe_load_images(batch_paths, mode=args.preprocess_mode, device=device)
+        if images is None or len(ok_paths) == 0:
+            continue
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=(device == "cuda"), dtype=dtype):
-                preds = model(images)
+                try:
+                    preds = model(images)
+                except Exception as e:
+                    print(f"Warning: model forward failed for a batch (size={len(ok_paths)}), skipping. Error: {e}")
+                    continue
 
         depth = preds["depth"]  # [B, S, H, W, 1] with B=1, S=N
         depth = depth.squeeze(0).detach().cpu().numpy()  # [S, H, W, 1]
 
-        for i, img_path in enumerate(batch_paths):
-            stem = Path(img_path).stem
+        for i, img_path in enumerate(ok_paths):
+            if image_root is not None:
+                rel = Path(img_path).relative_to(image_root)
+                stem = rel.stem
+                img_out_dir = out_dir / rel.parent
+                img_out_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                stem = Path(img_path).stem
+                img_out_dir = out_dir
             depth_i = depth[i, ..., 0]
 
-            npy_path = out_dir / f"{stem}.depth.npy"
+            npy_path = img_out_dir / f"{stem}.depth.npy"
             np.save(npy_path, depth_i.astype(np.float32))
 
             if args.save_png:
@@ -110,7 +186,7 @@ def main() -> None:
                         "--save_png requires imageio. Install e.g. `pip install imageio` or disable --save_png."
                     ) from e
 
-                png_path = out_dir / f"{stem}.depth.png"
+                png_path = img_out_dir / f"{stem}.depth.png"
                 iio.imwrite(png_path, _depth_to_uint16(depth_i))
 
         torch.cuda.empty_cache()
